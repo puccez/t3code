@@ -7,12 +7,15 @@ import {
   waitForEvenAppBridge,
 } from "@evenrealities/even_hub_sdk";
 import {
+  ApprovalRequestId,
   type ClientOrchestrationCommand,
   CommandId,
   MessageId,
   ORCHESTRATION_WS_METHODS,
   type OrchestrationProjectShell,
   type OrchestrationShellStreamItem,
+  type OrchestrationThread,
+  type OrchestrationThreadActivity,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import { makeWsRpcProtocolClient, type WsRpcProtocolClient } from "@t3tools/client-runtime/rpc";
@@ -84,6 +87,7 @@ async function getSocketUrl(): Promise<string> {
 type Screen =
   | { kind: "list" }
   | { kind: "thread"; threadId: string }
+  | { kind: "reader"; threadId: string; page: number }
   | { kind: "recording"; threadId: string }
   | { kind: "transcribing"; threadId: string }
   | { kind: "preview"; threadId: string; text: string }
@@ -97,6 +101,7 @@ const state = {
   cursor: 0,
   actionCursor: 0,
   synchronized: false,
+  detail: null as { threadId: string; thread: OrchestrationThread | null } | null,
 };
 
 let rpcClient: WsRpcProtocolClient | null = null;
@@ -132,8 +137,60 @@ function threadStatusLine(t: OrchestrationThreadShell): string {
   return "Nessun turn";
 }
 
-function threadActions(t: OrchestrationThreadShell): { label: string; id: string }[] {
-  const actions = [{ label: "Detta follow-up", id: "dictate" }];
+// Minimal port of apps/web/src/session-logic.ts derivePendingApprovals —
+// worth upstreaming into client-runtime so every surface shares it.
+type PendingApproval = { requestId: ApprovalRequestId; detail?: string };
+
+function derivePendingApprovals(
+  activities: readonly OrchestrationThreadActivity[],
+): PendingApproval[] {
+  const open = new Map<string, PendingApproval>();
+  for (const activity of activities) {
+    const payload =
+      activity.payload && typeof activity.payload === "object"
+        ? (activity.payload as Record<string, unknown>)
+        : null;
+    const requestId = payload && typeof payload.requestId === "string" ? payload.requestId : null;
+    if (!requestId) continue;
+    if (activity.kind === "approval.requested") {
+      const detail = typeof payload?.detail === "string" ? payload.detail : undefined;
+      open.set(requestId, {
+        requestId: ApprovalRequestId.make(requestId),
+        ...(detail !== undefined ? { detail } : {}),
+      });
+    } else if (
+      activity.kind === "approval.resolved" ||
+      activity.kind === "provider.approval.respond.failed"
+    ) {
+      open.delete(requestId);
+    }
+  }
+  return [...open.values()];
+}
+
+function currentPendingApprovals(threadId: string): PendingApproval[] {
+  const detail = state.detail;
+  if (!detail || detail.threadId !== threadId || !detail.thread) return [];
+  return derivePendingApprovals(detail.thread.activities);
+}
+
+function lastAssistantText(threadId: string): string | null {
+  const detail = state.detail;
+  if (!detail || detail.threadId !== threadId || !detail.thread) return null;
+  const message = [...detail.thread.messages].reverse().find((m) => m.role === "assistant");
+  return message?.text ?? null;
+}
+
+function threadActions(
+  t: OrchestrationThreadShell,
+): { label: string; id: "approve" | "deny" | "dictate" | "read" | "interrupt" }[] {
+  const actions: ReturnType<typeof threadActions> = [];
+  if (currentPendingApprovals(t.id).length > 0) {
+    actions.push({ label: "Approva richiesta", id: "approve" });
+    actions.push({ label: "Nega richiesta", id: "deny" });
+  }
+  actions.push({ label: "Detta follow-up", id: "dictate" });
+  if (lastAssistantText(t.id) !== null) actions.push({ label: "Leggi risposta", id: "read" });
   if (t.latestTurn?.state === "running")
     actions.push({ label: "Interrompi turn", id: "interrupt" });
   return actions;
@@ -186,15 +243,27 @@ function buildListPage(): RebuildPageContainer {
   return textPage("threads", rows.length > 0 ? rows.join("\n") : "(nessun thread)");
 }
 
+function summarySnippet(threadId: string): string | null {
+  const detail = state.detail;
+  if (!detail || detail.threadId !== threadId) return "(caricamento dettagli…)";
+  if (!detail.thread) return "(caricamento dettagli…)";
+  const lastActivity = detail.thread.activities.at(-1);
+  const source = lastActivity?.summary ?? lastAssistantText(threadId);
+  if (!source) return null;
+  return source.replace(/\s+/g, " ").slice(0, 110);
+}
+
 function buildThreadPage(threadId: string): RebuildPageContainer {
   const t = state.threads.get(threadId);
   if (!t) return textPage("thread", "Thread non trovato\n\n2x tap: indietro");
   const project = state.projects.get(t.projectId)?.title ?? "?";
   const actions = threadActions(t);
   if (state.actionCursor >= actions.length) state.actionCursor = 0;
+  const snippet = summarySnippet(threadId);
   const lines = [
     `${project} · ${t.title}`.slice(0, 60),
     threadStatusLine(t),
+    ...(snippet ? [snippet] : []),
     "",
     ...actions.map((a, i) => `${i === state.actionCursor ? ">" : " "} ${a.label}`),
     "",
@@ -203,12 +272,41 @@ function buildThreadPage(threadId: string): RebuildPageContainer {
   return textPage("thread", lines.join("\n"));
 }
 
+// Reader: last assistant message paginated into screen-sized chunks.
+const READER_PAGE_CHARS = 360;
+
+function readerPages(threadId: string): string[] {
+  const text = lastAssistantText(threadId) ?? "";
+  const words = text.replace(/\s+/g, " ").trim().split(" ");
+  const pages: string[] = [];
+  let current = "";
+  for (const word of words) {
+    if (current.length + word.length + 1 > READER_PAGE_CHARS) {
+      pages.push(current);
+      current = word;
+    } else {
+      current = current ? `${current} ${word}` : word;
+    }
+  }
+  if (current) pages.push(current);
+  return pages.length > 0 ? pages : ["(nessun testo)"];
+}
+
+function buildReaderPage(threadId: string, page: number): RebuildPageContainer {
+  const pages = readerPages(threadId);
+  const clamped = Math.max(0, Math.min(page, pages.length - 1));
+  const header = `— ${clamped + 1}/${pages.length} · swipe: pagine · 2x tap: indietro —`;
+  return textPage("reader", `${pages[clamped]}\n\n${header}`);
+}
+
 function buildScreen(): RebuildPageContainer {
   switch (state.screen.kind) {
     case "list":
       return buildListPage();
     case "thread":
       return buildThreadPage(state.screen.threadId);
+    case "reader":
+      return buildReaderPage(state.screen.threadId, state.screen.page);
     case "recording":
       return textPage("rec", "* REC — detta il prompt\n\ntap: fine dettatura\n2x tap: annulla");
     case "transcribing":
@@ -398,6 +496,77 @@ const runShellSubscription = (socketUrl: string, bridge: Bridge) =>
   });
 
 // ---------------------------------------------------------------------------
+// Thread detail subscription: full messages/activities/checkpoints for the
+// thread on screen. Live events arrive as raw orchestration events; instead of
+// replaying them client-side we resubscribe (debounced) for a fresh snapshot.
+// ---------------------------------------------------------------------------
+
+let detailController: AbortController | null = null;
+let detailRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function stopThreadDetail() {
+  detailController?.abort();
+  detailController = null;
+  if (detailRefreshTimer !== null) {
+    clearTimeout(detailRefreshTimer);
+    detailRefreshTimer = null;
+  }
+  state.detail = null;
+}
+
+type ThreadDetailItem =
+  | { kind: "synchronized" }
+  | { kind: "snapshot"; snapshot: { thread: OrchestrationThread } }
+  | { kind: "event"; event: unknown };
+
+function onDetailItem(bridge: Bridge, threadId: string, item: ThreadDetailItem) {
+  if (item.kind === "snapshot") {
+    state.detail = { threadId, thread: item.snapshot.thread };
+    scheduleRender(bridge);
+  } else if (item.kind === "event" && detailRefreshTimer === null) {
+    detailRefreshTimer = setTimeout(() => {
+      detailRefreshTimer = null;
+      if (state.detail?.threadId === threadId) ensureThreadDetail(bridge, threadId, true);
+    }, 500);
+  }
+}
+
+function ensureThreadDetail(bridge: Bridge, threadId: string, force = false) {
+  if (!force && state.detail?.threadId === threadId && detailController) return;
+  detailController?.abort();
+  if (state.detail?.threadId !== threadId) state.detail = { threadId, thread: null };
+  const t = state.threads.get(threadId);
+  if (!t || !rpcClient) return;
+  const controller = new AbortController();
+  detailController = controller;
+  const client = rpcClient;
+  const subscription = client[ORCHESTRATION_WS_METHODS.subscribeThread]({ threadId: t.id }).pipe(
+    Stream.runForEach((item) =>
+      Effect.sync(() => {
+        if (controller.signal.aborted) return;
+        onDetailItem(bridge, threadId, item);
+      }),
+    ),
+  );
+  Effect.runPromise(Effect.scoped(subscription), { signal: controller.signal }).catch(() => {});
+}
+
+async function respondApproval(bridge: Bridge, threadId: string, decision: "accept" | "decline") {
+  const approval = currentPendingApprovals(threadId)[0];
+  const t = state.threads.get(threadId);
+  if (!approval || !t) return;
+  await dispatchOrchestration({
+    type: "thread.approval.respond",
+    ...newCommandBase(),
+    threadId: t.id,
+    requestId: approval.requestId,
+    decision,
+  });
+  reportStatus(`approvazione: ${decision}`);
+  ensureThreadDetail(bridge, threadId, true);
+}
+
+// ---------------------------------------------------------------------------
 // Input events from the glasses touchpad.
 // ---------------------------------------------------------------------------
 
@@ -427,6 +596,7 @@ function wireInput(bridge: Bridge) {
           if (threadId) {
             state.screen = { kind: "thread", threadId };
             state.actionCursor = 0;
+            ensureThreadDetail(bridge, threadId);
             scheduleRender(bridge);
           }
         }
@@ -444,12 +614,37 @@ function wireInput(bridge: Bridge) {
         } else if (eventType === OsEventTypeList.CLICK_EVENT) {
           const action = actions[state.actionCursor];
           if (action?.id === "dictate") void startDictation(bridge, screen.threadId);
-          else if (action?.id === "interrupt")
+          else if (action?.id === "read") {
+            state.screen = { kind: "reader", threadId: screen.threadId, page: 0 };
+            scheduleRender(bridge);
+          } else if (action?.id === "approve" || action?.id === "deny") {
+            void respondApproval(
+              bridge,
+              screen.threadId,
+              action.id === "approve" ? "accept" : "decline",
+            ).catch((err) => reportStatus(`approval error: ${String(err)}`));
+          } else if (action?.id === "interrupt")
             void interruptTurn(screen.threadId).catch((err) =>
               reportStatus(`interrupt error: ${String(err)}`),
             );
         } else if (eventType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
           state.screen = { kind: "list" };
+          stopThreadDetail();
+          scheduleRender(bridge);
+        }
+        break;
+      }
+
+      case "reader": {
+        const pages = readerPages(screen.threadId);
+        if (eventType === OsEventTypeList.SCROLL_TOP_EVENT) {
+          state.screen = { ...screen, page: Math.max(0, screen.page - 1) };
+          scheduleRender(bridge);
+        } else if (eventType === OsEventTypeList.SCROLL_BOTTOM_EVENT) {
+          state.screen = { ...screen, page: Math.min(pages.length - 1, screen.page + 1) };
+          scheduleRender(bridge);
+        } else if (eventType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
+          state.screen = { kind: "thread", threadId: screen.threadId };
           scheduleRender(bridge);
         }
         break;
@@ -506,8 +701,13 @@ async function main() {
     }),
   );
   if (created !== 0) {
-    reportStatus(`createStartUpPageContainer failed: ${created}`);
-    return;
+    // A dev reload (or background restore) lands here: the host already has a
+    // startup page from this webview's previous life, so rebuild over it.
+    const rebuilt = await bridge.rebuildPageContainer(buildScreen());
+    if (!rebuilt) {
+      reportStatus(`createStartUpPageContainer failed: ${created}, rebuild failed too`);
+      return;
+    }
   }
   wireInput(bridge);
 
