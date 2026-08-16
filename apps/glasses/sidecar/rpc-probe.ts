@@ -19,7 +19,8 @@ import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
 import * as Socket from "effect/unstable/socket/Socket";
 
 const pairToken = process.argv[2];
-const origin = process.argv[3] ?? "http://localhost:13773";
+const positionalOrigin = process.argv[3]?.startsWith("--") ? undefined : process.argv[3];
+const origin = positionalOrigin ?? "http://localhost:13773";
 if (!pairToken) {
   console.error("usage: node sidecar/rpc-probe.ts <pairing-token> [server-origin]");
   process.exit(1);
@@ -110,20 +111,38 @@ const program = (socketUrl: string) =>
       console.log(`project "${SCRATCH_TITLE}" already exists: ${project.id}`);
     }
 
-    const threadId = ThreadId.make(crypto.randomUUID());
-    const createResult = yield* client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
-      type: "thread.create",
-      ...base(),
-      threadId,
-      projectId: project!.id,
-      title: "Test dagli occhiali",
-      modelSelection,
-      runtimeMode: donorThread.runtimeMode,
-      interactionMode: donorThread.interactionMode,
-      branch: null,
-      worktreePath: null,
-    });
-    console.log("thread.create →", JSON.stringify(createResult));
+    // --follow <threadId> reuses an existing thread instead of creating one;
+    // --text overrides the prompt.
+    const followIdx = process.argv.indexOf("--follow");
+    const textIdx = process.argv.indexOf("--text");
+    const rmIdx = process.argv.indexOf("--runtime-mode");
+    const runtimeMode =
+      rmIdx > -1
+        ? (process.argv[rmIdx + 1] as typeof donorThread.runtimeMode)
+        : donorThread.runtimeMode;
+    const promptText =
+      textIdx > -1 ? process.argv[textIdx + 1]! : "Rispondi soltanto con la parola: ciao";
+
+    let threadId: ThreadId;
+    if (followIdx > -1) {
+      threadId = ThreadId.make(process.argv[followIdx + 1]!);
+      console.log(`following existing thread ${threadId}`);
+    } else {
+      threadId = ThreadId.make(crypto.randomUUID());
+      const createResult = yield* client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+        type: "thread.create",
+        ...base(),
+        threadId,
+        projectId: project!.id,
+        title: "Test dagli occhiali",
+        modelSelection,
+        runtimeMode,
+        interactionMode: donorThread.interactionMode,
+        branch: null,
+        worktreePath: null,
+      });
+      console.log("thread.create →", JSON.stringify(createResult));
+    }
 
     const turnResult = yield* client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
       type: "thread.turn.start",
@@ -132,10 +151,10 @@ const program = (socketUrl: string) =>
       message: {
         messageId: MessageId.make(crypto.randomUUID()),
         role: "user",
-        text: "Rispondi soltanto con la parola: ciao",
+        text: promptText,
         attachments: [],
       },
-      runtimeMode: donorThread.runtimeMode,
+      runtimeMode,
       interactionMode: donorThread.interactionMode,
       createdAt: new Date().toISOString(),
       commandId: CommandId.make(crypto.randomUUID()),
