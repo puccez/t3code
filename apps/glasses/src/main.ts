@@ -33,18 +33,37 @@ function reportStatus(text: string) {
 }
 
 // ---------------------------------------------------------------------------
-// Auth: pairing token (#token=…) → bearer → per-connection WebSocket ticket.
-// Dev-only storage; on-device this moves to bridge.setLocalStorage, the only
-// persistence that survives Even App restarts.
+// Auth: pairing token (companion form or #token=…) → bearer → per-connection
+// WebSocket ticket. The bearer lives in bridge localStorage — the only storage
+// that survives Even App restarts — with browser localStorage as fallback for
+// bridge-less tabs and as migration path for older sessions.
 // ---------------------------------------------------------------------------
 
 const BEARER_KEY = "t3glasses.bearer";
 
-async function getBearer(): Promise<string> {
-  const stored = localStorage.getItem(BEARER_KEY);
-  if (stored) return stored;
-  const pairToken = new URLSearchParams(location.hash.slice(1)).get("token");
-  if (!pairToken) throw new Error("Not paired: open with #token=<pairing token>");
+let bridgeStorage: Bridge | null = null;
+
+async function storeGet(key: string): Promise<string> {
+  if (bridgeStorage) {
+    const fromBridge = await bridgeStorage.getLocalStorage(key).catch(() => "");
+    if (fromBridge) return fromBridge;
+  }
+  return localStorage.getItem(key) ?? "";
+}
+
+async function storeSet(key: string, value: string): Promise<void> {
+  if (bridgeStorage) await bridgeStorage.setLocalStorage(key, value).catch(() => false);
+  if (value === "") localStorage.removeItem(key);
+  else localStorage.setItem(key, value);
+}
+
+class NotPairedError extends Error {
+  constructor(message = "Non collegato") {
+    super(message);
+  }
+}
+
+async function exchangePairingToken(pairToken: string): Promise<string> {
   const res = await fetch("/oauth/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -60,8 +79,16 @@ async function getBearer(): Promise<string> {
   });
   if (!res.ok) throw new Error(`Token exchange failed: ${res.status}`);
   const json = (await res.json()) as { access_token: string };
-  localStorage.setItem(BEARER_KEY, json.access_token);
+  await storeSet(BEARER_KEY, json.access_token);
   return json.access_token;
+}
+
+async function getBearer(): Promise<string> {
+  const stored = await storeGet(BEARER_KEY);
+  if (stored) return stored;
+  const pairToken = new URLSearchParams(location.hash.slice(1)).get("token");
+  if (!pairToken) throw new NotPairedError();
+  return exchangePairingToken(pairToken);
 }
 
 async function getSocketUrl(): Promise<string> {
@@ -71,8 +98,8 @@ async function getSocketUrl(): Promise<string> {
     headers: { Authorization: `Bearer ${bearer}` },
   });
   if (res.status === 401) {
-    localStorage.removeItem(BEARER_KEY);
-    throw new Error("Session expired: pair again with #token=<pairing token>");
+    await storeSet(BEARER_KEY, "");
+    throw new NotPairedError("Sessione scaduta — ripeti il pairing");
   }
   if (!res.ok) throw new Error(`WebSocket ticket failed: ${res.status}`);
   const { ticket } = (await res.json()) as { ticket: string };
@@ -250,7 +277,7 @@ function summarySnippet(threadId: string): string | null {
   const lastActivity = detail.thread.activities.at(-1);
   const source = lastActivity?.summary ?? lastAssistantText(threadId);
   if (!source) return null;
-  return source.replace(/\s+/g, " ").slice(0, 110);
+  return inlineMarkdownToPlain(source).replace(/\s+/g, " ").slice(0, 110);
 }
 
 function buildThreadPage(threadId: string): RebuildPageContainer {
@@ -272,23 +299,85 @@ function buildThreadPage(threadId: string): RebuildPageContainer {
   return textPage("thread", lines.join("\n"));
 }
 
-// Reader: last assistant message paginated into screen-sized chunks.
-const READER_PAGE_CHARS = 360;
+// Reader: assistant markdown → plain display lines → pages by line count.
+// The display fits ~10 lines of ~48 wrapped chars (proportional font, so 48
+// monospace-budgeted chars never auto-wrap and line counting stays exact).
+// 8 body lines + blank + footer = 10.
+const READER_WRAP_COLS = 48;
+const READER_BODY_LINES = 8;
+
+function inlineMarkdownToPlain(text: string): string {
+  return text
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/(\*\*|__)([^*_]+)\1/g, "$2")
+    .replace(/`([^`]*)`/g, "$1");
+}
+
+function markdownToLines(text: string): string[] {
+  const lines: string[] = [];
+  let inFence = false;
+  for (const raw of text.split("\n")) {
+    if (/^\s*(```|~~~)/.test(raw)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) {
+      lines.push(`  ${raw.trimEnd()}`);
+      continue;
+    }
+    lines.push(inlineMarkdownToPlain(raw.replace(/^#{1,6}\s+/, "").trimEnd()));
+  }
+  const collapsed: string[] = [];
+  for (const line of lines) {
+    if (line === "" && collapsed.at(-1) === "") continue;
+    collapsed.push(line);
+  }
+  while (collapsed[0] === "") collapsed.shift();
+  while (collapsed.at(-1) === "") collapsed.pop();
+  return collapsed;
+}
+
+function wrapLine(line: string, cols: number): string[] {
+  if (line.length <= cols) return [line];
+  const baseIndent = line.match(/^\s*/)?.[0] ?? "";
+  const contIndent = `${baseIndent}  `;
+  const maxWord = cols - contIndent.length;
+  const words = line
+    .trim()
+    .split(/\s+/)
+    .flatMap((word) => {
+      if (word.length <= maxWord) return [word];
+      const parts: string[] = [];
+      for (let i = 0; i < word.length; i += maxWord) parts.push(word.slice(i, i + maxWord));
+      return parts;
+    });
+  const out: string[] = [];
+  let current = baseIndent;
+  for (const word of words) {
+    const candidate = current.trim() === "" ? `${current}${word}` : `${current} ${word}`;
+    if (candidate.length > cols && current.trim() !== "") {
+      out.push(current);
+      current = `${contIndent}${word}`;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current.trim() !== "") out.push(current);
+  return out;
+}
 
 function readerPages(threadId: string): string[] {
   const text = lastAssistantText(threadId) ?? "";
-  const words = text.replace(/\s+/g, " ").trim().split(" ");
+  const lines = markdownToLines(text).flatMap((line) => wrapLine(line, READER_WRAP_COLS));
   const pages: string[] = [];
-  let current = "";
-  for (const word of words) {
-    if (current.length + word.length + 1 > READER_PAGE_CHARS) {
-      pages.push(current);
-      current = word;
-    } else {
-      current = current ? `${current} ${word}` : word;
+  for (let i = 0; i < lines.length; ) {
+    if (lines[i] === "") {
+      i += 1;
+      continue;
     }
+    pages.push(lines.slice(i, i + READER_BODY_LINES).join("\n"));
+    i += READER_BODY_LINES;
   }
-  if (current) pages.push(current);
   return pages.length > 0 ? pages : ["(nessun testo)"];
 }
 
@@ -675,12 +764,68 @@ function wireInput(bridge: Bridge) {
 }
 
 // ---------------------------------------------------------------------------
+// Companion page (phone side): pairing form + connection state.
+// ---------------------------------------------------------------------------
+
+// Null-tolerant lookups: a stale cached index.html without these elements must
+// not take down the glasses UI, which lives in this same module.
+const pairStateEl = document.getElementById("pair-state");
+const pairTokenEl = document.getElementById("pair-token") as HTMLInputElement | null;
+const pairConnectEl = document.getElementById("pair-connect") as HTMLButtonElement | null;
+const pairDisconnectEl = document.getElementById("pair-disconnect") as HTMLButtonElement | null;
+
+// Accepts a bare pairing token or a full pairing URL (#token=… / ?token=…).
+function extractPairingToken(raw: string): string {
+  try {
+    const url = new URL(raw);
+    const fromHash = new URLSearchParams(url.hash.slice(1)).get("token");
+    return fromHash ?? url.searchParams.get("token") ?? raw;
+  } catch {
+    return raw;
+  }
+}
+
+async function refreshPairingUi() {
+  if (!pairStateEl || !pairDisconnectEl) return;
+  const paired = (await storeGet(BEARER_KEY)) !== "";
+  pairStateEl.textContent = paired
+    ? `Collegato a ${location.host}`
+    : "Non collegato — incolla il pairing token";
+  pairDisconnectEl.disabled = !paired;
+}
+
+function wireCompanionPage() {
+  if (!pairStateEl || !pairTokenEl || !pairConnectEl || !pairDisconnectEl) return;
+  const stateEl = pairStateEl;
+  const tokenEl = pairTokenEl;
+  const connectEl = pairConnectEl;
+  pairConnectEl.addEventListener("click", () => {
+    const raw = tokenEl.value.trim();
+    if (!raw) return;
+    connectEl.disabled = true;
+    stateEl.textContent = "Pairing in corso…";
+    exchangePairingToken(extractPairingToken(raw)).then(
+      () => location.reload(),
+      (err) => {
+        stateEl.textContent = `Pairing fallito: ${String(err)}`;
+        connectEl.disabled = false;
+      },
+    );
+  });
+  pairDisconnectEl.addEventListener("click", () => {
+    void storeSet(BEARER_KEY, "").then(() => location.reload());
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Boot.
 // ---------------------------------------------------------------------------
 
 async function main() {
   reportStatus("waiting for Even bridge…");
   const bridge = await waitForEvenAppBridge();
+  bridgeStorage = bridge;
+  void refreshPairingUi();
   const created = await bridge.createStartUpPageContainer(
     new CreateStartUpPageContainer({
       containerTotalNum: 1,
@@ -712,11 +857,29 @@ async function main() {
   wireInput(bridge);
 
   reportStatus("authenticating…");
-  const socketUrl = await getSocketUrl();
+  let socketUrl: string;
+  try {
+    socketUrl = await getSocketUrl();
+  } catch (err) {
+    if (err instanceof NotPairedError) {
+      reportStatus(`${err.message} — usa il modulo di pairing qui sotto`);
+      await bridge.rebuildPageContainer(
+        textPage(
+          "pair",
+          "T3 Glasses — non collegato\n\nApri T3 Glasses sul telefono e incolla\nil pairing token per collegarti.",
+        ),
+      );
+      void refreshPairingUi();
+      return;
+    }
+    throw err;
+  }
+  void refreshPairingUi();
   reportStatus("opening websocket…");
   await Effect.runPromise(Effect.scoped(runShellSubscription(socketUrl, bridge))).catch((err) => {
     reportStatus(`connection lost: ${String(err)}`);
   });
 }
 
+wireCompanionPage();
 main().catch((err) => reportStatus(`fatal: ${String(err)}`));

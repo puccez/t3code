@@ -1,31 +1,124 @@
 <!doctype html>
-<html lang="en">
+<html lang="it">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>T3 Glasses</title>
     <style>
+      :root {
+        color-scheme: dark;
+      }
       body {
         margin: 0;
-        padding: 24px;
+        padding: 20px;
         font-family: system-ui, sans-serif;
         background: #111;
         color: #eee;
+        max-width: 480px;
+        margin-inline: auto;
       }
       h1 {
-        font-size: 18px;
+        font-size: 20px;
+        margin: 4px 0 2px;
+      }
+      .tagline {
+        color: #888;
+        font-size: 13px;
+        margin: 0 0 16px;
       }
       #status {
         color: #8c8;
-        font-size: 14px;
+        font-size: 13px;
         white-space: pre-wrap;
+        margin-bottom: 16px;
+      }
+      .card {
+        background: #1a1a1a;
+        border: 1px solid #2a2a2a;
+        border-radius: 10px;
+        padding: 16px;
+        margin-bottom: 16px;
+      }
+      .card h2 {
+        font-size: 15px;
+        margin: 0 0 8px;
+      }
+      #pair-state {
+        font-size: 13px;
+        color: #aaa;
+        margin-bottom: 12px;
+        overflow-wrap: anywhere;
+      }
+      input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 12px;
+        border-radius: 8px;
+        border: 1px solid #333;
+        background: #0d0d0d;
+        color: #eee;
+        font-size: 14px;
+        margin-bottom: 10px;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+      }
+      button {
+        flex: 1;
+        padding: 12px;
+        border-radius: 8px;
+        border: none;
+        font-size: 14px;
+        font-weight: 600;
+        background: #2f6f3f;
+        color: #fff;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #2a2a2a;
+        color: #ccc;
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      .hint {
+        font-size: 12px;
+        color: #777;
+        margin: 12px 0 0;
+      }
+      .hint code {
+        color: #9c9;
       }
     </style>
   </head>
   <body>
     <h1>T3 Glasses</h1>
-    <p>Companion page — settings will live here. The UI renders on your G2.</p>
+    <p class="tagline">L'interfaccia gira sui tuoi G2 — qui trovi pairing e impostazioni.</p>
     <div id="status">starting…</div>
+
+    <section class="card">
+      <h2>Pairing</h2>
+      <div id="pair-state">…</div>
+      <input
+        id="pair-token"
+        type="text"
+        placeholder="Pairing token o URL di pairing"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+      />
+      <div class="row">
+        <button id="pair-connect">Collega</button>
+        <button id="pair-disconnect" class="secondary" disabled>Scollega</button>
+      </div>
+      <p class="hint">
+        Genera un token sul server con <code>npx t3 pair</code> e incollalo qui — va bene anche
+        l'URL di pairing completo.
+      </p>
+    </section>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
