@@ -1,0 +1,21 @@
+{
+  "package_id": "com.t3tools.glasses",
+  "edition": "202601",
+  "name": "T3 Glasses",
+  "version": "0.1.0",
+  "min_app_version": "2.0.0",
+  "min_sdk_version": "0.0.12",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "network",
+      "desc": "Connects to your T3 Code server to monitor and drive coding agents.",
+      "whitelist": ["http://100.90.84.33", "ws://100.90.84.33"]
+    },
+    {
+      "name": "g2-microphone",
+      "desc": "Dictate prompts to your coding agents hands-free."
+    }
+  ],
+  "supported_languages": ["en", "it"]
+}

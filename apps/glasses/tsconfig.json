@@ -1,0 +1,22 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "namespaceImportPackages": ["effect"],
+        "diagnosticSeverity": {
+          // This app is a browser webview glued to the EvenHub SDK's
+          // callback/promise API surface; browser globals are its platform.
+          "globalConsole": "off",
+          "globalFetch": "off",
+          "globalTimers": "off",
+          "globalDate": "off",
+          "cryptoRandomUUID": "off"
+        }
+      }
+    ]
+  },
+  "include": ["src", "vite.config.ts"]
+}
