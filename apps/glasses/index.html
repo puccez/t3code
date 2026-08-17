@@ -91,6 +91,27 @@
       .hint code {
         color: #9c9;
       }
+      .field-label {
+        font-size: 13px;
+        color: #aaa;
+        margin-bottom: 10px;
+      }
+      .choices {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .choices label {
+        display: flex;
+        gap: 10px;
+        align-items: baseline;
+        font-size: 14px;
+        color: #ccc;
+        cursor: pointer;
+      }
+      .choices strong {
+        color: #eee;
+      }
     </style>
   </head>
   <body>
@@ -117,6 +138,25 @@
         Genera un token sul server con <code>npx t3 pair</code> e incollalo qui — va bene anche
         l'URL di pairing completo.
       </p>
+    </section>
+
+    <section class="card">
+      <h2>Impostazioni</h2>
+      <div class="field-label">Home Mode — il layout d'ingresso degli occhiali</div>
+      <div class="choices">
+        <label>
+          <input type="radio" name="homeMode" value="lista" checked />
+          <span><strong>Lista</strong> — tutti i thread, ordinati per attività</span>
+        </label>
+        <label>
+          <input type="radio" name="homeMode" value="project" />
+          <span><strong>Per project</strong> — gerarchica: project, poi i suoi thread</span>
+        </label>
+        <label>
+          <input type="radio" name="homeMode" value="focus" />
+          <span><strong>Focus</strong> — direttamente sull'ultimo thread attivo</span>
+        </label>
+      </div>
     </section>
 
     <script type="module" src="/src/main.ts"></script>
