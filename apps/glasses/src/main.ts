@@ -1253,14 +1253,17 @@ function wireInput(bridge: Bridge) {
         break;
 
       case "thread": {
+        // One swipe = one page (with a one-line overlap): many small swipes
+        // are the single most uncomfortable gesture on the touchpad/ring.
+        const tailStep = TAIL_ROWS - 1;
         if (eventType === OsEventTypeList.SCROLL_TOP_EVENT) {
           state.screen = {
             ...screen,
-            scroll: Math.min(maxTailScroll(screen.threadId), screen.scroll + 1),
+            scroll: Math.min(maxTailScroll(screen.threadId), screen.scroll + tailStep),
           };
           scheduleRender(bridge);
         } else if (eventType === OsEventTypeList.SCROLL_BOTTOM_EVENT) {
-          state.screen = { ...screen, scroll: Math.max(0, screen.scroll - 1) };
+          state.screen = { ...screen, scroll: Math.max(0, screen.scroll - tailStep) };
           scheduleRender(bridge);
         } else if (eventType === OsEventTypeList.CLICK_EVENT) {
           state.screen = { kind: "actions", threadId: screen.threadId };
