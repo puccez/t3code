@@ -450,6 +450,45 @@ function buildProjectPickPage(): RebuildPageContainer {
 
 // Thread screen: terminal-style live tail (Even Terminal look). Chronological
 // merge of one-line activity summaries and message text; newest at the bottom.
+// Bookkeeping activities carry no signal for the wearer.
+const TAIL_NOISE_KINDS = new Set(["context-window.updated", "checkpoint.captured"]);
+
+function activityPayload(a: OrchestrationThreadActivity): Record<string, unknown> | null {
+  return a.payload && typeof a.payload === "object" ? (a.payload as Record<string, unknown>) : null;
+}
+
+// No call id links started/updated/completed, and adapters change `detail`
+// between phases (claudeAgent: "Bash: {}" → "Bash: date"), so correlate by
+// (turn, itemType): a later completed makes earlier phases noise.
+function toolKey(a: OrchestrationThreadActivity): string {
+  const p = activityPayload(a);
+  return `${a.turnId}|${String(p?.itemType)}`;
+}
+
+// Reduce a provider detail to the bare command: strip `bash -lc '<cmd>'`
+// wrappers (codex) and `Bash:` tool-name prefixes (claudeAgent).
+function commandDetail(detail: string): string {
+  let cmd = detail.trim().replace(/^[A-Za-z]+:\s*/, "");
+  const wrapped = cmd.match(/^\S*bash\s+-l?c\s+([\s\S]*)$/);
+  if (wrapped) cmd = wrapped[1]!.trim();
+  if ((cmd.startsWith("'") && cmd.endsWith("'")) || (cmd.startsWith('"') && cmd.endsWith('"')))
+    cmd = cmd.slice(1, -1);
+  return cmd === "{}" ? "" : cmd;
+}
+
+function activityLabel(a: OrchestrationThreadActivity): string {
+  const p = activityPayload(a);
+  const det = typeof p?.detail === "string" ? p.detail : null;
+  if (p?.itemType === "command_execution" && det) {
+    const cmd = commandDetail(det);
+    if (cmd !== "") {
+      const running = a.kind === "tool.started" || a.kind === "tool.updated";
+      return `${running ? ">" : "$"} ${cmd}`;
+    }
+  }
+  return `· ${a.summary}`;
+}
+
 function tailLines(threadId: string): string[] {
   const detail = state.detail;
   if (!detail || detail.threadId !== threadId || !detail.thread) return ["(caricamento attività…)"];
@@ -459,9 +498,20 @@ function tailLines(threadId: string): string[] {
     if (m.role === "user") entries.push({ at: m.createdAt, lines: [truncateRow(`» ${m.text}`)] });
     else entries.push({ at: m.createdAt, lines: wrapMarkdown(m.text) });
   }
-  for (const a of detail.thread.activities) {
-    entries.push({ at: a.createdAt, lines: [truncateRow(`· ${a.summary}`)] });
-  }
+  const activities = detail.thread.activities;
+  const lastCompleted = new Map<string, number>();
+  activities.forEach((a, i) => {
+    if (a.kind === "tool.completed") lastCompleted.set(toolKey(a), i);
+  });
+  activities.forEach((a, i) => {
+    if (TAIL_NOISE_KINDS.has(a.kind)) return;
+    if (
+      (a.kind === "tool.started" || a.kind === "tool.updated") &&
+      (lastCompleted.get(toolKey(a)) ?? -1) > i
+    )
+      return;
+    entries.push({ at: a.createdAt, lines: [truncateRow(activityLabel(a))] });
+  });
   entries.sort((a, b) => a.at.localeCompare(b.at));
   const lines = entries.flatMap((e) => e.lines);
   return lines.length > 0 ? lines : ["(nessuna attività)"];
