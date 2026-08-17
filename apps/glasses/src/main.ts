@@ -35,6 +35,18 @@ function reportStatus(text: string) {
   console.log(`[t3-glasses] ${text}`);
 }
 
+// crypto.randomUUID exists only in secure contexts, and this app is served
+// over plain http on the tailnet — fall back to a v4 built from
+// getRandomValues, which is available everywhere.
+function uuid(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Auth: pairing token (companion form or #token=…) → bearer → per-connection
 // WebSocket ticket. The bearer lives in bridge localStorage — the only storage
@@ -128,7 +140,6 @@ type Screen =
   | { kind: "projectPick" }
   | { kind: "thread"; threadId: string; scroll: number }
   | { kind: "actions"; threadId: string }
-  | { kind: "reader"; threadId: string; page: number }
   | { kind: "recording"; target: DictationTarget }
   | { kind: "transcribing"; target: DictationTarget }
   | { kind: "preview"; target: DictationTarget; text: string }
@@ -220,23 +231,15 @@ function currentPendingApprovals(threadId: string): PendingApproval[] {
   return derivePendingApprovals(detail.thread.activities);
 }
 
-function lastAssistantText(threadId: string): string | null {
-  const detail = state.detail;
-  if (!detail || detail.threadId !== threadId || !detail.thread) return null;
-  const message = [...detail.thread.messages].reverse().find((m) => m.role === "assistant");
-  return message?.text ?? null;
-}
-
 function threadActions(
   t: OrchestrationThreadShell,
-): { label: string; id: "approve" | "deny" | "dictate" | "read" | "interrupt" }[] {
+): { label: string; id: "approve" | "deny" | "dictate" | "interrupt" }[] {
   const actions: ReturnType<typeof threadActions> = [];
   if (currentPendingApprovals(t.id).length > 0) {
     actions.push({ label: "Approva richiesta", id: "approve" });
     actions.push({ label: "Nega richiesta", id: "deny" });
   }
   actions.push({ label: "Detta follow-up", id: "dictate" });
-  if (lastAssistantText(t.id) !== null) actions.push({ label: "Leggi risposta", id: "read" });
   if (t.latestTurn?.state === "running")
     actions.push({ label: "Interrompi turn", id: "interrupt" });
   return actions;
@@ -552,30 +555,6 @@ function buildActionsPage(threadId: string): RebuildPageContainer {
   return textPage("actions", lines.join("\n"));
 }
 
-// Reader: full assistant text paginated by line count (drill-down).
-const READER_BODY_LINES = 8;
-
-function readerPages(threadId: string): string[] {
-  const lines = wrapMarkdown(lastAssistantText(threadId) ?? "");
-  const pages: string[] = [];
-  for (let i = 0; i < lines.length; ) {
-    if (lines[i] === "") {
-      i += 1;
-      continue;
-    }
-    pages.push(lines.slice(i, i + READER_BODY_LINES).join("\n"));
-    i += READER_BODY_LINES;
-  }
-  return pages.length > 0 ? pages : ["(nessun testo)"];
-}
-
-function buildReaderPage(threadId: string, page: number): RebuildPageContainer {
-  const pages = readerPages(threadId);
-  const clamped = Math.max(0, Math.min(page, pages.length - 1));
-  const header = `— ${clamped + 1}/${pages.length} · swipe: pagine · 2x tap: indietro —`;
-  return textPage("reader", `${pages[clamped]}\n\n${header}`);
-}
-
 function buildScreen(): RebuildPageContainer {
   switch (state.screen.kind) {
     case "list":
@@ -590,8 +569,6 @@ function buildScreen(): RebuildPageContainer {
       return buildThreadPage(state.screen.threadId, state.screen.scroll);
     case "actions":
       return buildActionsPage(state.screen.threadId);
-    case "reader":
-      return buildReaderPage(state.screen.threadId, state.screen.page);
     case "recording": {
       const target = state.screen.target;
       const where =
@@ -736,7 +713,7 @@ async function stopDictation(bridge: Bridge, target: DictationTarget, cancelled:
 
 function newCommandBase() {
   return {
-    commandId: CommandId.make(crypto.randomUUID()),
+    commandId: CommandId.make(uuid()),
     createdAt: new Date().toISOString(),
   };
 }
@@ -759,7 +736,7 @@ async function sendFollowUp(bridge: Bridge, threadId: string, text: string) {
       ...newCommandBase(),
       threadId: t.id,
       message: {
-        messageId: MessageId.make(crypto.randomUUID()),
+        messageId: MessageId.make(uuid()),
         role: "user",
         text,
         attachments: [],
@@ -791,7 +768,7 @@ async function createThreadAndStart(bridge: Bridge, projectId: string, text: str
   }
   state.screen = { kind: "sending", target: { kind: "new", projectId } };
   scheduleRender(bridge);
-  const threadId = ThreadId.make(crypto.randomUUID());
+  const threadId = ThreadId.make(uuid());
   const runtimeMode = donor?.runtimeMode ?? DEFAULT_RUNTIME_MODE;
   const interactionMode = donor?.interactionMode ?? DEFAULT_PROVIDER_INTERACTION_MODE;
   try {
@@ -812,7 +789,7 @@ async function createThreadAndStart(bridge: Bridge, projectId: string, text: str
       ...newCommandBase(),
       threadId,
       message: {
-        messageId: MessageId.make(crypto.randomUUID()),
+        messageId: MessageId.make(uuid()),
         role: "user",
         text,
         attachments: [],
@@ -1094,10 +1071,7 @@ function wireInput(bridge: Bridge) {
           const action = actions[state.actionCursor];
           if (action?.id === "dictate")
             void startDictation(bridge, { kind: "thread", threadId: screen.threadId });
-          else if (action?.id === "read") {
-            state.screen = { kind: "reader", threadId: screen.threadId, page: 0 };
-            scheduleRender(bridge);
-          } else if (action?.id === "approve" || action?.id === "deny") {
+          else if (action?.id === "approve" || action?.id === "deny") {
             void respondApproval(
               bridge,
               screen.threadId,
@@ -1107,21 +1081,6 @@ function wireInput(bridge: Bridge) {
             void interruptTurn(screen.threadId).catch((err) =>
               reportStatus(`interrupt error: ${String(err)}`),
             );
-        } else if (eventType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
-          state.screen = { kind: "thread", threadId: screen.threadId, scroll: 0 };
-          scheduleRender(bridge);
-        }
-        break;
-      }
-
-      case "reader": {
-        const pages = readerPages(screen.threadId);
-        if (eventType === OsEventTypeList.SCROLL_TOP_EVENT) {
-          state.screen = { ...screen, page: Math.max(0, screen.page - 1) };
-          scheduleRender(bridge);
-        } else if (eventType === OsEventTypeList.SCROLL_BOTTOM_EVENT) {
-          state.screen = { ...screen, page: Math.min(pages.length - 1, screen.page + 1) };
-          scheduleRender(bridge);
         } else if (eventType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
           state.screen = { kind: "thread", threadId: screen.threadId, scroll: 0 };
           scheduleRender(bridge);
