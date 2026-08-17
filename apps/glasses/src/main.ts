@@ -19,7 +19,11 @@ import {
   type OrchestrationThread,
   type OrchestrationThreadActivity,
   type OrchestrationThreadShell,
+  type ProviderOptionDescriptor,
+  type ServerProvider,
+  type ServerProviderModel,
   ThreadId,
+  WS_METHODS,
 } from "@t3tools/contracts";
 import { makeWsRpcProtocolClient, type WsRpcProtocolClient } from "@t3tools/client-runtime/rpc";
 import * as Effect from "effect/Effect";
@@ -140,6 +144,8 @@ type Screen =
   | { kind: "projectPick" }
   | { kind: "thread"; threadId: string; scroll: number }
   | { kind: "actions"; threadId: string }
+  | { kind: "modelProviderPick"; threadId: string }
+  | { kind: "modelPick"; threadId: string; instanceId: string }
   | { kind: "recording"; target: DictationTarget }
   | { kind: "transcribing"; target: DictationTarget }
   | { kind: "preview"; target: DictationTarget; text: string }
@@ -153,6 +159,9 @@ const state = {
   screen: { kind: "list" } as Screen,
   listedRows: [] as ListRow[],
   listedProjectIds: [] as string[],
+  listedInstanceIds: [] as string[],
+  listedModelSlugs: [] as string[],
+  providers: [] as readonly ServerProvider[],
   cursor: 0,
   actionCursor: 0,
   synchronized: false,
@@ -231,17 +240,89 @@ function currentPendingApprovals(threadId: string): PendingApproval[] {
   return derivePendingApprovals(detail.thread.activities);
 }
 
-function threadActions(
+// ---------------------------------------------------------------------------
+// Provider/model catalog (from serverGetConfig) and per-thread settings.
+// ---------------------------------------------------------------------------
+
+function threadProvider(t: OrchestrationThreadShell): ServerProvider | null {
+  return state.providers.find((p) => p.instanceId === t.modelSelection.instanceId) ?? null;
+}
+
+function threadModel(t: OrchestrationThreadShell): ServerProviderModel | null {
+  return threadProvider(t)?.models.find((m) => m.slug === t.modelSelection.model) ?? null;
+}
+
+function selectableProviders(): ServerProvider[] {
+  return state.providers.filter(
+    (p) => p.enabled && p.installed && p.availability !== "unavailable" && p.models.length > 0,
+  );
+}
+
+function threadOptionDescriptors(t: OrchestrationThreadShell): readonly ProviderOptionDescriptor[] {
+  return threadModel(t)?.capabilities?.optionDescriptors ?? [];
+}
+
+// Selected value → descriptor currentValue → descriptor default.
+function optionValue(
   t: OrchestrationThreadShell,
-): { label: string; id: "approve" | "deny" | "dictate" | "interrupt" }[] {
-  const actions: ReturnType<typeof threadActions> = [];
+  desc: ProviderOptionDescriptor,
+): string | boolean | undefined {
+  const selected = t.modelSelection.options?.find((o) => o.id === desc.id)?.value;
+  if (selected !== undefined) return selected;
+  if (desc.currentValue !== undefined) return desc.currentValue;
+  return desc.type === "select" ? desc.options.find((o) => o.isDefault)?.id : undefined;
+}
+
+function optionDisplay(
+  desc: ProviderOptionDescriptor,
+  value: string | boolean | undefined,
+): string {
+  if (desc.type === "boolean") return value === true ? "on" : "off";
+  return desc.options.find((o) => o.id === value)?.label ?? String(value ?? "—");
+}
+
+const RUNTIME_MODES: OrchestrationThreadShell["runtimeMode"][] = [
+  "approval-required",
+  "auto-accept-edits",
+  "auto",
+  "full-access",
+];
+const INTERACTION_MODES: OrchestrationThreadShell["interactionMode"][] = ["default", "plan"];
+
+type ThreadActionId =
+  | { kind: "approve" }
+  | { kind: "deny" }
+  | { kind: "dictate" }
+  | { kind: "interrupt" }
+  | { kind: "model" }
+  | { kind: "runtime" }
+  | { kind: "interaction" }
+  | { kind: "option"; optionId: string };
+
+function threadActions(t: OrchestrationThreadShell): { label: string; id: ThreadActionId }[] {
+  const actions: { label: string; id: ThreadActionId }[] = [];
   if (currentPendingApprovals(t.id).length > 0) {
-    actions.push({ label: "Approva richiesta", id: "approve" });
-    actions.push({ label: "Nega richiesta", id: "deny" });
+    actions.push({ label: "Approva richiesta", id: { kind: "approve" } });
+    actions.push({ label: "Nega richiesta", id: { kind: "deny" } });
   }
-  actions.push({ label: "Detta follow-up", id: "dictate" });
+  actions.push({ label: "Detta follow-up", id: { kind: "dictate" } });
   if (t.latestTurn?.state === "running")
-    actions.push({ label: "Interrompi turn", id: "interrupt" });
+    actions.push({ label: "Interrompi turn", id: { kind: "interrupt" } });
+  const provider = threadProvider(t);
+  const model = threadModel(t);
+  const modelLabel = `${provider?.displayName ?? t.modelSelection.instanceId} · ${
+    model?.shortName ?? model?.name ?? t.modelSelection.model
+  }`;
+  actions.push({ label: truncateRow(`Modello: ${modelLabel}`), id: { kind: "model" } });
+  for (const desc of threadOptionDescriptors(t)) {
+    actions.push({
+      label: truncateRow(`${desc.label}: ${optionDisplay(desc, optionValue(t, desc))}`),
+      id: { kind: "option", optionId: desc.id },
+    });
+  }
+  actions.push({ label: `Permessi: ${t.runtimeMode}`, id: { kind: "runtime" } });
+  if (provider?.showInteractionModeToggle ?? true)
+    actions.push({ label: `Interazione: ${t.interactionMode}`, id: { kind: "interaction" } });
   return actions;
 }
 
@@ -547,12 +628,55 @@ function buildActionsPage(threadId: string): RebuildPageContainer {
   const lines = [
     truncateRow(`${badge(t)} ${t.title}`),
     truncateRow(threadStatusLine(t)),
-    "",
-    ...actions.map((a, i) => `${i === state.actionCursor ? ">" : " "} ${a.label}`),
-    "",
-    "2x tap: indietro",
+    ...cursorRows(
+      actions.map((a) => a.label),
+      state.actionCursor,
+      7,
+    ),
+    "tap: esegui/cicla · 2x tap: indietro",
   ];
   return textPage("actions", lines.join("\n"));
+}
+
+function buildModelProviderPickPage(threadId: string): RebuildPageContainer {
+  const t = state.threads.get(threadId);
+  const providers = selectableProviders();
+  state.listedInstanceIds = providers.map((p) => p.instanceId);
+  clampCursor(providers.length);
+  if (providers.length === 0)
+    return textPage("modelprov", "(nessun provider disponibile)\n\n2x tap: indietro");
+  const labels = providers.map((p) => {
+    const current = p.instanceId === t?.modelSelection.instanceId ? " ·" : "";
+    const locked =
+      p.requiresNewThreadForModelChange && p.instanceId !== t?.modelSelection.instanceId
+        ? " (solo nuovo thread)"
+        : "";
+    return truncateRow(`${p.displayName ?? p.instanceId}${current}${locked}`);
+  });
+  const header = "Modello — scegli il provider";
+  return textPage(
+    "modelprov",
+    [header, ...cursorRows(labels, state.cursor, LIST_ROWS - 1)].join("\n"),
+  );
+}
+
+function buildModelPickPage(threadId: string, instanceId: string): RebuildPageContainer {
+  const t = state.threads.get(threadId);
+  const provider = state.providers.find((p) => p.instanceId === instanceId);
+  const models = (provider?.models ?? []).filter((m) => !m.isLegacy);
+  state.listedModelSlugs = models.map((m) => m.slug);
+  clampCursor(models.length);
+  if (models.length === 0) return textPage("modelpick", "(nessun modello)\n\n2x tap: indietro");
+  const labels = models.map((m) => {
+    const current =
+      instanceId === t?.modelSelection.instanceId && m.slug === t?.modelSelection.model ? " ·" : "";
+    return truncateRow(`${m.shortName ?? m.name}${m.isDefault ? " (default)" : ""}${current}`);
+  });
+  const header = truncateRow(`${provider?.displayName ?? instanceId} — scegli il modello`);
+  return textPage(
+    "modelpick",
+    [header, ...cursorRows(labels, state.cursor, LIST_ROWS - 1)].join("\n"),
+  );
 }
 
 function buildScreen(): RebuildPageContainer {
@@ -569,6 +693,10 @@ function buildScreen(): RebuildPageContainer {
       return buildThreadPage(state.screen.threadId, state.screen.scroll);
     case "actions":
       return buildActionsPage(state.screen.threadId);
+    case "modelProviderPick":
+      return buildModelProviderPickPage(state.screen.threadId);
+    case "modelPick":
+      return buildModelPickPage(state.screen.threadId, state.screen.instanceId);
     case "recording": {
       const target = state.screen.target;
       const where =
@@ -819,6 +947,89 @@ async function interruptTurn(threadId: string) {
   reportStatus("interrupt inviato");
 }
 
+// Tap-to-cycle setters: each tap advances to the next value and dispatches
+// immediately; the shell subscription re-renders the row with the new value.
+
+async function cycleRuntimeMode(threadId: string) {
+  const t = state.threads.get(threadId);
+  if (!t) return;
+  const next = RUNTIME_MODES[(RUNTIME_MODES.indexOf(t.runtimeMode) + 1) % RUNTIME_MODES.length]!;
+  await dispatchOrchestration({
+    type: "thread.runtime-mode.set",
+    ...newCommandBase(),
+    threadId: t.id,
+    runtimeMode: next,
+  });
+}
+
+async function cycleInteractionMode(threadId: string) {
+  const t = state.threads.get(threadId);
+  if (!t) return;
+  const next =
+    INTERACTION_MODES[
+      (INTERACTION_MODES.indexOf(t.interactionMode) + 1) % INTERACTION_MODES.length
+    ]!;
+  await dispatchOrchestration({
+    type: "thread.interaction-mode.set",
+    ...newCommandBase(),
+    threadId: t.id,
+    interactionMode: next,
+  });
+}
+
+// thread.meta.update has no createdAt field — send commandId only.
+async function cycleOption(threadId: string, optionId: string) {
+  const t = state.threads.get(threadId);
+  if (!t) return;
+  const desc = threadOptionDescriptors(t).find((d) => d.id === optionId);
+  if (!desc) return;
+  const current = optionValue(t, desc);
+  let next: string | boolean;
+  if (desc.type === "boolean") next = current !== true;
+  else {
+    const ids = desc.options.map((o) => o.id);
+    if (ids.length === 0) return;
+    next = ids[(ids.indexOf(String(current)) + 1) % ids.length]!;
+  }
+  const options = [
+    ...(t.modelSelection.options ?? []).filter((o) => o.id !== optionId),
+    { id: optionId, value: next },
+  ];
+  await dispatchOrchestration({
+    type: "thread.meta.update",
+    commandId: CommandId.make(uuid()),
+    threadId: t.id,
+    modelSelection: {
+      instanceId: t.modelSelection.instanceId,
+      model: t.modelSelection.model,
+      options,
+    },
+  });
+}
+
+async function selectModel(bridge: Bridge, threadId: string, instanceId: string, slug: string) {
+  const t = state.threads.get(threadId);
+  const provider = state.providers.find((p) => p.instanceId === instanceId);
+  if (!t || !provider) return;
+  const unchanged = t.modelSelection.instanceId === instanceId && t.modelSelection.model === slug;
+  if (!unchanged && provider.requiresNewThreadForModelChange) {
+    reportStatus(`${provider.displayName ?? instanceId} cambia modello solo su un nuovo thread`);
+    return;
+  }
+  if (!unchanged) {
+    // Options are per-model — drop them and let the new model's defaults apply.
+    await dispatchOrchestration({
+      type: "thread.meta.update",
+      commandId: CommandId.make(uuid()),
+      threadId: t.id,
+      modelSelection: { instanceId: provider.instanceId, model: slug },
+    });
+  }
+  state.screen = { kind: "actions", threadId };
+  state.actionCursor = 0;
+  scheduleRender(bridge);
+}
+
 // ---------------------------------------------------------------------------
 // Shell subscription → state.
 // ---------------------------------------------------------------------------
@@ -878,6 +1089,11 @@ const runShellSubscription = (socketUrl: string, bridge: Bridge) =>
     const client = yield* makeWsRpcProtocolClient.pipe(Effect.provide(protocolContext));
     rpcClient = client;
     reportStatus("connected, subscribing to shell…");
+    // Provider/model catalog for the actions menu; non-fatal if unavailable.
+    const config = yield* client[WS_METHODS.serverGetConfig]({}).pipe(
+      Effect.orElseSucceed(() => null),
+    );
+    if (config) state.providers = config.providers;
     yield* client[ORCHESTRATION_WS_METHODS.subscribeShell]({}).pipe(
       Stream.runForEach((item) => Effect.sync(() => onShellItem(item, bridge))),
     );
@@ -1069,20 +1285,75 @@ function wireInput(bridge: Bridge) {
           scheduleRender(bridge);
         } else if (eventType === OsEventTypeList.CLICK_EVENT) {
           const action = actions[state.actionCursor];
-          if (action?.id === "dictate")
-            void startDictation(bridge, { kind: "thread", threadId: screen.threadId });
-          else if (action?.id === "approve" || action?.id === "deny") {
-            void respondApproval(
-              bridge,
-              screen.threadId,
-              action.id === "approve" ? "accept" : "decline",
-            ).catch((err) => reportStatus(`approval error: ${String(err)}`));
-          } else if (action?.id === "interrupt")
-            void interruptTurn(screen.threadId).catch((err) =>
-              reportStatus(`interrupt error: ${String(err)}`),
-            );
+          if (!action) break;
+          const threadId = screen.threadId;
+          const fail = (what: string) => (err: unknown) =>
+            reportStatus(`${what} error: ${String(err)}`);
+          switch (action.id.kind) {
+            case "dictate":
+              void startDictation(bridge, { kind: "thread", threadId });
+              break;
+            case "approve":
+            case "deny":
+              void respondApproval(
+                bridge,
+                threadId,
+                action.id.kind === "approve" ? "accept" : "decline",
+              ).catch(fail("approval"));
+              break;
+            case "interrupt":
+              void interruptTurn(threadId).catch(fail("interrupt"));
+              break;
+            case "model":
+              state.screen = { kind: "modelProviderPick", threadId };
+              state.cursor = 0;
+              scheduleRender(bridge);
+              break;
+            case "runtime":
+              void cycleRuntimeMode(threadId).catch(fail("runtime-mode"));
+              break;
+            case "interaction":
+              void cycleInteractionMode(threadId).catch(fail("interaction-mode"));
+              break;
+            case "option":
+              void cycleOption(threadId, action.id.optionId).catch(fail("option"));
+              break;
+          }
         } else if (eventType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
           state.screen = { kind: "thread", threadId: screen.threadId, scroll: 0 };
+          scheduleRender(bridge);
+        }
+        break;
+      }
+
+      case "modelProviderPick":
+      case "modelPick": {
+        const listed =
+          screen.kind === "modelProviderPick" ? state.listedInstanceIds : state.listedModelSlugs;
+        if (eventType === OsEventTypeList.SCROLL_TOP_EVENT) {
+          state.cursor = Math.max(0, state.cursor - 1);
+          scheduleRender(bridge);
+        } else if (eventType === OsEventTypeList.SCROLL_BOTTOM_EVENT) {
+          state.cursor = Math.min(listed.length - 1, state.cursor + 1);
+          scheduleRender(bridge);
+        } else if (eventType === OsEventTypeList.CLICK_EVENT) {
+          const key = listed[state.cursor];
+          if (!key) break;
+          if (screen.kind === "modelProviderPick") {
+            state.screen = { kind: "modelPick", threadId: screen.threadId, instanceId: key };
+            state.cursor = 0;
+            scheduleRender(bridge);
+          } else {
+            void selectModel(bridge, screen.threadId, screen.instanceId, key).catch((err) =>
+              reportStatus(`model error: ${String(err)}`),
+            );
+          }
+        } else if (eventType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
+          state.screen =
+            screen.kind === "modelPick"
+              ? { kind: "modelProviderPick", threadId: screen.threadId }
+              : { kind: "actions", threadId: screen.threadId };
+          state.cursor = 0;
           scheduleRender(bridge);
         }
         break;
