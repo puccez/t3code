@@ -1039,6 +1039,9 @@ function onShellItem(item: OrchestrationShellStreamItem, bridge: Bridge) {
     case "snapshot":
       state.projects = new Map(item.snapshot.projects.map((p) => [p.id, p]));
       state.threads = new Map(item.snapshot.threads.map((t) => [t.id, t]));
+      // After a reconnect the previous detail subscription is gone with its
+      // socket — re-ensure it for whatever thread is on screen.
+      if (state.detail) ensureThreadDetail(bridge, state.detail.threadId, true);
       // Apply the Home Mode entry layout once threads are known.
       if (!state.homeApplied) {
         state.homeApplied = true;
@@ -1512,29 +1515,47 @@ async function main() {
   }
   wireInput(bridge);
 
-  reportStatus("authenticating…");
-  let socketUrl: string;
-  try {
-    socketUrl = await getSocketUrl();
-  } catch (err) {
-    if (err instanceof NotPairedError) {
-      reportStatus(`${err.message} — usa il modulo di pairing qui sotto`);
-      await bridge.rebuildPageContainer(
-        textPage(
-          "pair",
-          "T3 Glasses — non collegato\n\nApri T3 Glasses sul telefono e incolla\nil pairing token per collegarti.",
-        ),
-      );
-      void refreshPairingUi();
-      return;
+  // Connection loop: the socket dies whenever the phone roams networks or
+  // the server restarts — reconnect with capped backoff instead of dying.
+  let attempt = 0;
+  for (;;) {
+    reportStatus("authenticating…");
+    let socketUrl: string;
+    try {
+      socketUrl = await getSocketUrl();
+    } catch (err) {
+      if (err instanceof NotPairedError) {
+        reportStatus(`${err.message} — usa il modulo di pairing qui sotto`);
+        await bridge.rebuildPageContainer(
+          textPage(
+            "pair",
+            "T3 Glasses — non collegato\n\nApri T3 Glasses sul telefono e incolla\nil pairing token per collegarti.",
+          ),
+        );
+        void refreshPairingUi();
+        return;
+      }
+      reportStatus(`auth error: ${String(err)}`);
+      socketUrl = "";
     }
-    throw err;
+    if (socketUrl !== "") {
+      void refreshPairingUi();
+      reportStatus("opening websocket…");
+      const connectedAt = Date.now();
+      await Effect.runPromise(Effect.scoped(runShellSubscription(socketUrl, bridge))).catch(
+        (err) => {
+          reportStatus(`connection lost: ${String(err)}`);
+        },
+      );
+      rpcClient = null;
+      // A connection that held for a while resets the backoff.
+      if (Date.now() - connectedAt > 15_000) attempt = 0;
+    }
+    attempt += 1;
+    const delayMs = Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5));
+    reportStatus(`riconnessione tra ${Math.round(delayMs / 1000)}s…`);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
-  void refreshPairingUi();
-  reportStatus("opening websocket…");
-  await Effect.runPromise(Effect.scoped(runShellSubscription(socketUrl, bridge))).catch((err) => {
-    reportStatus(`connection lost: ${String(err)}`);
-  });
 }
 
 wireCompanionPage();
